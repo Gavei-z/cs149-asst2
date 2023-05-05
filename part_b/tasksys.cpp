@@ -126,58 +126,185 @@ const char* TaskSystemParallelThreadPoolSleeping::name() {
     return "Parallel + Thread Pool + Sleep";
 }
 
-TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads) {
-    //
-    // TODO: CS149 student implementations may decide to perform setup
-    // operations (such as thread pool construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads),_num_threads{num_threads}{
+    start(num_threads);
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
-    //
-    // TODO: CS149 student implementations may decide to perform cleanup
-    // operations (such as thread pool shutdown construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+    terminate = true;
+
+    while(true) {
+        std::unique_lock<std::mutex> guard{queue_mutex};
+        if (sleepThreadNum == _num_threads) break;
+    }
+
+    // Notify all the threads to return 
+    producer.notify_all();
+
+    for (int i = 0; i < _num_threads; ++ i) {
+        threads[i].join();
+    }
+
+    // free the memory
+    for (auto task: finished) {
+        delete task.second;
+    }
 }
 
-void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
-
-
-    //
-    // TODO: CS149 students will modify the implementation of this
-    // method in Parts A and B.  The implementation provided below runs all
-    // tasks sequentially on the calling thread.
-    //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+void TaskSystemParallelThreadPoolSleeping::start(int num_threads) {
+    threads.resize(num_threads);
+    for(int i = 0; i < num_threads; ++ i) {
+        threads[i] = std::move(std:: thread(&TaskSystemParallelThreadPoolSleeping::threadLoop, this, i));
     }
+}
+
+void TaskSystemParallelThreadPoolSleeping::threadLoop(int id_) {
+    while (1) {
+        int index = -1;
+        Task* task = nullptr;
+        {
+            std::unique_lock<std::mutex> guard{queue_mutex};
+            if (ready.empty()) {
+                // we should check to move the blocked to the ready
+                if (!blocked.empty()) moveBlockTaskToReady();
+            }
+
+            if (ready.empty()) {
+                // Ready is still empty, we should sleep the thread.
+                sleepThreadNum ++;
+                producer.wait(guard);
+                sleepThreadNum --;
+            }
+        }
+        /*
+            we should tell whether the ready is empty
+            but it should not be like this: rand() % 0, so we need handle
+            this corner case.
+        */
+        if(!ready.empty()) {
+            index = rand() % ready.size();
+            // Use random to choose the task for each thread for simplicity.
+            task = ready[index];
+        }
+
+        if (terminate) return;
+
+        if (task == nullptr) continue;
+
+        int processing = -1, finished = -1;
+        {
+            std::unique_lock<std::mutex> guard{task->task_mutex};
+            processing = task->processing;
+            // There are some situations `processing` will exceed
+            // the total number, because we don't know when the
+            // `deleteFinishedTask` is finished. We may choose the
+            // task which is actually finished (or just only one)
+            if (processing >= task->total_tasks) continue;
+            task->processing ++;
+        }
+
+        if (processing < task->total_tasks) {
+            task->runnable->runTask(processing, task->total_tasks);
+            std::unique_lock<std::mutex> guard{task->task_mutex};
+            task->finished++;
+            finished = task->finished;
+        }
+
+        if (finished == task->total_tasks) {
+            std::unique_lock<std::mutex> guard{queue_mutex};
+            deleteFinishedTask(task);
+            // When we signalSync, there are may be some threads which
+            // are processing useless. So it may just return to the
+            // destructor. So in the destructor we must wait for all
+            // the thread going to sleep. And we call `notify_all` to
+            // make all the threads stop. The design here should be
+            // optimized. However, I don't have enough time...
+            signalSync();
+        }
+    }
+}
+
+void TaskSystemParallelThreadPoolSleeping::deleteFinishedTask(Task* task) {
+    size_t i = 0;
+    for (; i < ready.size(); ++ i) {
+        if (ready[i] == task) break;
+    }
+
+    finished.insert({ready[i]->id, ready[i]});
+    ready.erase(ready.begin() + i);
+
+    // 依赖这个task的所有task中，它的task依赖项数目减一。
+    if (depencency.count(task->id)) {
+        for (auto t: depencency[task->id])
+            t->dependencies --;
+    }
+}
+
+/*
+    Move blocked task to the ready when the task's dependency is all finished.
+*/
+void TaskSystemParallelThreadPoolSleeping::moveBlockTaskToReady() {
+    // 遍历所有阻塞task，查看是否可以存在不阻塞的task，以拿出来执行。
+    std::vector<Task*> moved{};
+    for (auto task: blocked) {
+        if (task->dependencies == 0) {
+            ready.push_back(task);
+            moved.push_back(task);
+        }
+    }
+    for (auto task: moved) blocked.erase(task);
+}
+
+/*
+    All the tasks are finished, which means `ready` and `blocked`
+    are empty, we could signal the ONLY ONE consumer.
+*/
+void TaskSystemParallelThreadPoolSleeping::signalSync() {
+    // ready和block为空了
+    if (ready.empty() && blocked.empty()) 
+        consumer.notify_one();
+}
+     
+/*
+    It is easy for us to simulate the `run`. Just call the `runAsyncWithDeps` and
+    use `sync` for synchronization. This is the most easy part in part B.
+*/
+
+void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
+    runAsyncWithDeps(runnable, num_total_tasks, {});
+    sync();
 }
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                                     const std::vector<TaskID>& deps) {
+    // 新建一个task，放进阻塞队列。
+    Task* task = new Task(id, runnable, num_total_tasks, deps.size());
+    {
+        std::unique_lock<std::mutex> guard{queue_mutex};
 
+        blocked.insert(task);
 
-    //
-    // TODO: CS149 students will implement this method in Part B.
-    //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+        // Record dependency information for later processing
+        for (TaskID dep: deps) {
+            if (depencency.count(dep)) {
+                depencency[dep].insert(task);
+            } else {
+                depencency[dep] = std::unordered_set<Task*>{task};
+            }
+        }
+        producer.notify_all();
     }
-
-    return 0;
+    return id ++;
 }
 
+/*
+    This function is provided to the user for waiting for
+    all tasks finished. We can just use a singel condition
+    variable to achieve the functionality.
+*/
 void TaskSystemParallelThreadPoolSleeping::sync() {
-
-    //
-    // TODO: CS149 students will modify the implementation of this method in Part B.
-    //
-
-    return;
+    std::unique_lock<std::mutex> lock{queue_mutex};
+    if(!ready.empty() || !blocked.empty()) {
+        consumer.wait(lock);
+    }
 }

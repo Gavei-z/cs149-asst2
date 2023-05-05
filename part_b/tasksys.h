@@ -1,6 +1,14 @@
 #ifndef _TASKSYS_H
 #define _TASKSYS_H
 
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <random>
+#include <unordered_set>
+#include <set>
+#include <unordered_map>
+#include <condition_variable>
 #include "itasksys.h"
 
 /*
@@ -53,6 +61,19 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         void sync();
 };
 
+class Task {
+public:
+    TaskID id;
+    IRunnable* runnable;
+    int processing = 0;         // The next job for this task need to be handled.
+    int finished = 0;           // Indicate how many tasks we have finished.
+    int total_tasks = 0;
+    size_t dependencies;        // If not 0, we just run this task.
+    std::mutex task_mutex;
+    Task(TaskID id_, IRunnable* runnable_, int total_tasks_, size_t deps):
+        id(id_), runnable(runnable_), total_tasks(total_tasks_), dependencies(deps){}
+};
+
 /*
  * TaskSystemParallelThreadPoolSleeping: This class is the student's
  * optimized implementation of a parallel task execution engine that uses
@@ -60,6 +81,26 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
  * itasksys.h for documentation of the ITaskSystem interface.
  */
 class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
+    private:
+        bool terminate = false;                         // Indicate whether to stop the thread pool
+        int _num_threads = 0;                           // Indicate how many threads
+        int sleepThreadNum = 0;                         // The number of thread which is sleeping
+        std::unordered_map<TaskID, Task*> finished {};  // To record the finished task
+        std::vector<Task*> ready {};                    // The task is ready to be processed
+        std::unordered_set<Task*> blocked {};           // The task is blocked
+        std::vector<std::thread> threads;
+        std::unordered_map<TaskID, 
+            std::unordered_set<Task*>> depencency {};   // The dependency, indicate the task's dependencies.
+
+        TaskID id = 0;
+        std:: mutex queue_mutex;
+        std:: condition_variable consumer;
+        std:: condition_variable producer;
+        void start(int num_threads);
+        void threadLoop(int index);
+        void deleteFinishedTask(Task* task);
+        void moveBlockTaskToReady();
+        void signalSync();
     public:
         TaskSystemParallelThreadPoolSleeping(int num_threads);
         ~TaskSystemParallelThreadPoolSleeping();
